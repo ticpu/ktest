@@ -490,6 +490,17 @@ start_vm()
     # upper case vars aren't exported to vm:
     local home=$HOME
 
+    # Mounts outside $home under the trees the guest uses: their absolute paths
+    # (worktree gitdirs, the modules build link) resolve only if linked there too.
+    local ktest_host_mounts="" p m
+    for p in "$ktest_dir" "$ktest_out" "${ktest_deps_dir:-$HOME/.ktest/deps}" \
+	     "${ktest_deps_dir:-$HOME/.ktest/deps}"/*; do
+	[[ -e $p ]] || continue
+	m=$(findmnt -no TARGET -T "$(readlink -f "$p")")
+	[[ $m = / || $m = "$home" || $m = "$home"/* ]] && continue
+	[[ " $ktest_host_mounts " = *" $m "* ]] || ktest_host_mounts+=" $m"
+    done
+
     get_tmpdir
 
     rm -f "$ktest_out/core.*"

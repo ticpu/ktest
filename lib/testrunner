@@ -47,6 +47,14 @@ fi
 mkdir -p $(dirname $home)
 ln -sf /host/$home $home
 
+# The same for host mounts outside $home; a test mounting on /mnt hides any
+# link under it from then on.
+for m in ${ktest_host_mounts:-}; do
+    [[ -e $m || -L $m ]] && continue
+    mkdir -p "$(dirname "$m")"
+    ln -s "/host$m" "$m"
+done
+
 # Per-slot cargo home: $ktest_deps_dir is this slot's own workspace, so
 # the N VMs sharing a host don't fight over one ~/.cargo — cargo's
 # package-cache lock doesn't coordinate across host-mount clients and
