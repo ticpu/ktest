@@ -1,0 +1,520 @@
+#!/usr/bin/env bash
+#
+# Directory link-count injection tests: whether fsck detects a wrong
+# subdirectory count, what the unlink path does with one, and whether
+# reattaching a directory to lost+found keeps every snapshot's view of
+# lost+found counted.
+#
+# A directory's bi_nlink is its subdirectory count; stat shows it plus 2
+# (bch2_inode_nlink_get()), so an injected bi_nlink=2 reads as Links 4 and
+# a wrapped 4294967295 as Links 1. Inode fields are injected with kvdb
+# `update`, which goes through the unpacked inode; a field-path `get`
+# resolves against bch_inode_v3, where bi_nlink and bi_dir are packed
+# varints, so reads parse the rendered key instead (inode_field()).
+#
+# Each case is a pair: a test asserting the correct behaviour and a
+# control the code passes today. The controls prove the setup and the
+# oracle; their failure means the test is broken, not the filesystem.
+# Failing until fixed, by the analysis they reproduce:
+#
+#   empty_dir_wrong_nlink - check_dirents only counts subdirectories of a
+#       directory owning a live dirent key, and check_nlinks skips
+#       directories, so an empty directory's count is never checked.
+#   rmdir_stale_count_reaps - unlink decrements a directory's stale count
+#       instead of marking it unlinked, and clears its backpointer: the
+#       inode leaks and the next fsck reports it unreachable.
+#   rmdir_uncounted_subdir_wrap - the parent's count is decremented with
+#       wrapping arithmetic, and once its last dirent is gone the empty
+#       directory case above hides the result.
+#   reattach_bumps_every_lostfound_version - reattach bumps lost+found's
+#       count in the reattached inode's snapshot only, while the dirent it
+#       creates is visible in every descendant. fsck -y's own verify pass
+#       repairs the other versions in the same run, so what fails is the
+#       inode_dir_wrong_nlink counter, not the second fsck -n.
+#   reattach_rmdir_collapse - the field cycle composed from the above.
+#
+# The fsck contract follows snapshot-inject.ktest: fsck -y must detect, a
+# second fsck -n is the repair oracle, and every test declares the
+# superblock error counters it expects. Each test checks its injection is
+# still on disk before fsck runs. show_dir() prints the state that decides
+# a result - stat Links, and bi_nlink, flags and bi_dir of every inode
+# version - pass or fail.
+#
+# No bcachefs_test_end_checks: these tests intentionally stamp error
+# counters.
+
+. $(dirname $(readlink -e "${BASH_SOURCE[0]}"))/bcachefs-test-libs.sh
+
+config-scratch-devs 4G
+
+kvdb()
+{
+    bcachefs kvdb ${ktest_scratch_dev[0]} "$@"
+}
+
+kvdb_rw()
+{
+    bcachefs kvdb --rw ${ktest_scratch_dev[0]} "$@"
+}
+
+ktest_expect_sb_errors=""
+
+new_fs()
+{
+    run_quiet "" bcachefs format -f ${ktest_scratch_dev[0]}
+    mount -t bcachefs ${ktest_scratch_dev[0]} /mnt
+    ktest_expect_sb_errors=""
+}
+
+# The snapshot a subvolume points at: subvol_snapshot <subvol id>
+subvol_snapshot()
+{
+    kvdb -c "get subvolumes 0:$1:0 snapshot"
+}
+
+snap_state()
+{
+    kvdb -c "get snapshots 0:$1:0 state"
+}
+
+# inode_field <inum> <snapshot> <bi_nlink|bi_dir|flags|...>
+inode_field()
+{
+    kvdb -c "get inodes 0:$1:$2" | sed -n "s/^[[:space:]]*$3=//p"
+}
+
+# Snapshot ids holding an inode key for <inum>
+inode_snaps()
+{
+    kvdb -c "list inodes" |
+	sed -n "s/^u64s [0-9]* type inode[a-z0-9_]* 0:$1:\([0-9A-Za-z_]*\) .*/\1/p" |
+	sed 's/U32_MAX/4294967295/'
+}
+
+# Position of the dirent with the given name: dirent_pos <name>
+dirent_pos()
+{
+    kvdb -c 'list dirents' |
+	sed -n "s/.*type dirent \([0-9A-Z_:]*\).*: $1 ->.*/\1/p" | head -1 |
+	sed 's/U32_MAX/4294967295/'
+}
+
+# show_dir <label> <inum>: every inode version of <inum>, unmounted
+show_dir()
+{
+    local s snaps=$(inode_snaps $2)
+
+    if [[ -z $snaps ]]; then
+	echo "$1 (inum $2): no inode key"
+	return
+    fi
+    for s in $snaps; do
+	echo "$1 (inum $2) snapshot $s:" \
+	     "bi_nlink=$(inode_field $2 $s bi_nlink)" \
+	     "flags=$(inode_field $2 $s flags)" \
+	     "bi_dir=$(inode_field $2 $s bi_dir)"
+    done
+}
+
+# stat_links <path>: Links of a path, on the mounted fs
+stat_links()
+{
+    local l=$(stat -c %h $1)
+    echo "stat $1 Links $l" >&2
+    echo $l
+}
+
+sb_errors()
+{
+    bcachefs show-super -f errors,errors_v2 ${ktest_scratch_dev[0]} |
+	sed -nE '/^errors(_v2)? /,${/^errors(_v2)? /!p;}'
+}
+
+expect_field()      # expect_field <inum> <snapshot> <field> <value>
+{
+    local got=$(inode_field $1 $2 $3)
+    if [[ $got != $4 ]]; then
+	echo "FAILED: setup - inode $1:$2 $3 is '$got', not $4"
+	exit 1
+    fi
+}
+
+check_sb_errors()
+{
+    echo "sb errors:"
+    sb_errors
+    if ! check_bcachefs_errors ${ktest_scratch_dev[0]}; then
+	echo "FAILED: superblock error counters the test didn't declare" \
+	     "(ktest_expect_sb_errors='${ktest_expect_sb_errors:-}')"
+	exit 1
+    fi
+}
+
+# fsck -n must run clean; on failure print what it found and fail
+fsck_clean()
+{
+    local rc=0
+    bcachefs fsck -n ${ktest_scratch_dev[0]} || rc=$?
+    echo "fsck -n exited $rc"
+    if (( rc != 0 )); then
+	echo "sb errors:"
+	sb_errors
+	echo "FAILED: $1"
+	exit 1
+    fi
+}
+
+# fsck -y must detect, a second fsck -n must run clean, and nothing
+# beyond $ktest_expect_sb_errors may be stamped. Returns 1 with the reason
+# printed, so the caller can show the resulting state before failing.
+check_fsck()
+{
+    local rc1=0 rc2=0
+
+    bcachefs fsck -y ${ktest_scratch_dev[0]} || rc1=$?
+    echo "first fsck -y exited $rc1"
+    if (( rc1 == 0 )); then
+	echo "FAILED: fsck missed injected corruption"
+	return 1
+    fi
+
+    bcachefs fsck -n ${ktest_scratch_dev[0]} || rc2=$?
+    echo "second fsck -n exited $rc2"
+    if (( rc2 != 0 )); then
+	echo "sb errors:"
+	sb_errors
+	echo "FAILED: errors remain after fsck -y"
+	return 1
+    fi
+
+    check_sb_errors
+}
+
+# ── an empty directory's count ───────────────────────────────────────────
+
+d_inum=
+
+# A directory /d with bi_nlink=2 injected, true count 0: dir_wrong_count
+# <empty|nonempty>. nonempty gives d a file, so it owns a live dirent key.
+dir_wrong_count()
+{
+    new_fs
+    mkdir /mnt/d
+    if [[ $1 == nonempty ]]; then
+	echo f > /mnt/d/f
+    fi
+    d_inum=$(stat -c %i /mnt/d)
+    umount /mnt
+
+    local snap=$(subvol_snapshot 1)
+    kvdb_rw -c "update inodes 0:$d_inum:$snap bi_nlink=2"
+    expect_field $d_inum $snap bi_nlink 2
+    show_dir d $d_inum
+    mount -t bcachefs ${ktest_scratch_dev[0]} /mnt
+    stat_links /mnt/d > /dev/null
+    umount /mnt
+
+    local failed=0
+    ktest_expect_sb_errors="inode_dir_wrong_nlink"
+    check_fsck || failed=1
+
+    show_dir d $d_inum
+    mount -t bcachefs ${ktest_scratch_dev[0]} /mnt
+    local links=$(stat_links /mnt/d)
+    umount /mnt
+
+    if (( failed )); then
+	exit 1
+    fi
+    if [[ $links != 2 ]]; then
+	echo "FAILED: d Links $links after repair, want 2"
+	exit 1
+    fi
+}
+
+test_empty_dir_wrong_nlink()
+{
+    dir_wrong_count empty
+}
+
+test_nonempty_dir_wrong_nlink()
+{
+    dir_wrong_count nonempty
+}
+
+# ── rmdir of a directory with a stale count ──────────────────────────────
+
+# rmdir_reaps <inject|clean>: rmdir /d must remove the inode, whatever d's
+# count said. A fix may report the count at rmdir time, hence the
+# declaration; today nothing is stamped.
+rmdir_reaps()
+{
+    new_fs
+    mkdir /mnt/d
+    d_inum=$(stat -c %i /mnt/d)
+    umount /mnt
+
+    local snap=$(subvol_snapshot 1)
+    if [[ $1 == inject ]]; then
+	kvdb_rw -c "update inodes 0:$d_inum:$snap bi_nlink=2"
+	expect_field $d_inum $snap bi_nlink 2
+    fi
+
+    mount -t bcachefs ${ktest_scratch_dev[0]} /mnt
+    stat_links /mnt/d > /dev/null
+    rmdir /mnt/d
+    umount /mnt
+
+    show_dir d $d_inum
+    if [[ -n $(inode_snaps $d_inum) ]]; then
+	fsck_clean "rmdir left inode $d_inum on disk, and fsck -n reports it"
+	echo "FAILED: rmdir left inode $d_inum on disk"
+	exit 1
+    fi
+
+    ktest_expect_sb_errors="inode_dir_wrong_nlink"
+    fsck_clean "fsck -n not clean after rmdir"
+    check_sb_errors
+}
+
+test_rmdir_stale_count_reaps()
+{
+    rmdir_reaps inject
+}
+
+test_rmdir_reaps()
+{
+    rmdir_reaps clean
+}
+
+# ── the parent's count on rmdir ──────────────────────────────────────────
+
+# rmdir_subdir <inject|clean>: p holds c, inject leaves p counting 0
+# subdirectories; then rmdir p/c. p's count must not wrap, or if it does,
+# fsck has to find it.
+rmdir_subdir()
+{
+    new_fs
+    mkdir -p /mnt/p/c
+    local p=$(stat -c %i /mnt/p)
+    umount /mnt
+
+    local snap=$(subvol_snapshot 1)
+    if [[ $1 == inject ]]; then
+	kvdb_rw -c "update inodes 0:$p:$snap bi_nlink=0"
+	expect_field $p $snap bi_nlink 0
+    else
+	expect_field $p $snap bi_nlink 1
+    fi
+
+    mount -t bcachefs ${ktest_scratch_dev[0]} /mnt
+    rmdir /mnt/p/c
+    stat_links /mnt/p > /dev/null
+    umount /mnt
+
+    show_dir p $p
+    local nlink=$(inode_field $p $snap bi_nlink)
+    if (( nlink < 2**31 )); then
+	fsck_clean "fsck -n not clean after rmdir"
+	check_sb_errors
+	return
+    fi
+
+    echo "p's bi_nlink wrapped to $nlink"
+    ktest_expect_sb_errors="inode_dir_wrong_nlink"
+    check_fsck || exit 1
+}
+
+test_rmdir_uncounted_subdir_wrap()
+{
+    rmdir_subdir inject
+}
+
+test_rmdir_counted_subdir()
+{
+    rmdir_subdir clean
+}
+
+# ── reattaching into lost+found under a snapshot ─────────────────────────
+
+o_inum=
+lf_inum=
+
+# Directory o, orphaned in the interior snapshot of main and snap.
+# orphan_in_interior <touch|notouch> <o's bi_nlink>: touch gives lost+found
+# its own version in main's leaf; a nonzero count makes o stale, as the
+# field's leaked directories were.
+#
+# Deleting o's dirent leaves the root's count one too high in each of its
+# three versions (interior, main's leaf, snap's leaf - snapshot creation
+# writes all three), which the first fsck would report alongside the case
+# under test. So the root is decremented too, as an unlink would.
+orphan_in_interior()
+{
+    new_fs
+    mkdir /mnt/o
+    (cd /mnt && bcachefs subvolume snapshot snap)
+    if [[ $1 == touch ]]; then
+	touch /mnt/lost+found
+    fi
+    o_inum=$(stat -c %i /mnt/o)
+    lf_inum=$(stat -c %i /mnt/lost+found)
+    local root=$(stat -c %i /mnt)
+    umount /mnt
+
+    local main=$(subvol_snapshot 1)
+    local o_snaps=($(inode_snaps $o_inum))
+    if (( ${#o_snaps[@]} != 1 )); then
+	echo "FAILED: setup - o has versions at ${o_snaps[*]}, not one"
+	exit 1
+    fi
+    local interior=${o_snaps[0]}
+    if [[ $interior == $main ]]; then
+	echo "FAILED: setup - o's only version is in main's leaf $main"
+	exit 1
+    fi
+
+    local pos=$(dirent_pos o)
+    if [[ -z $pos ]]; then
+	echo "FAILED: setup - couldn't find o's dirent"
+	exit 1
+    fi
+
+    local cmds=(-c "set dirents $pos deleted"
+		-c "update inodes 0:$o_inum:$interior bi_dir=0 bi_dir_offset=0 bi_nlink=$2")
+    local s n root_snaps=($(inode_snaps $root))
+    for s in ${root_snaps[@]}; do
+	n=$(inode_field $root $s bi_nlink)
+	cmds+=(-c "update inodes 0:$root:$s bi_nlink=$((n - 1))")
+    done
+    kvdb_rw "${cmds[@]}"
+
+    # The orphan has to still be on disk, or fsck has nothing to reattach
+    assert_output_lacks ": o ->" kvdb -c 'list dirents'
+    expect_field $o_inum $interior bi_dir 0
+    expect_field $o_inum $interior bi_nlink $2
+    for s in ${root_snaps[@]}; do
+	expect_field $root $s bi_nlink 1
+    done
+
+    local lf_snaps=" $(inode_snaps $lf_inum | tr '\n' ' ')"
+    if [[ $lf_snaps != *" $interior "* ]]; then
+	echo "FAILED: setup - lost+found has no version at interior $interior"
+	exit 1
+    fi
+    if [[ $1 == touch && $lf_snaps != *" $main "* ]]; then
+	echo "FAILED: setup - touch left lost+found without a version in main's leaf $main"
+	exit 1
+    fi
+    if [[ $1 == notouch && $lf_snaps == *" $main "* ]]; then
+	echo "FAILED: setup - lost+found has a version in main's leaf $main"
+	exit 1
+    fi
+
+    echo "main leaf $main, snap leaf $(subvol_snapshot 2), interior $interior, root versions ${root_snaps[*]}"
+    show_dir o $o_inum
+    show_dir lost+found $lf_inum
+}
+
+# reattach_counts <touch|notouch>: after fsck reattaches o, lost+found
+# counts it in main and in snap.
+reattach_counts()
+{
+    orphan_in_interior $1 0
+
+    local failed=0
+    ktest_expect_sb_errors="inode_unreachable"
+    check_fsck || failed=1
+
+    show_dir o $o_inum
+    show_dir lost+found $lf_inum
+    mount -t bcachefs ${ktest_scratch_dev[0]} /mnt
+    ls -l /mnt/lost+found
+    local main=$(stat_links /mnt/lost+found)
+    local snap=$(stat_links /mnt/snap/lost+found)
+    umount /mnt
+
+    if (( failed )); then
+	exit 1
+    fi
+    if [[ $main != 3 || $snap != 3 ]]; then
+	echo "FAILED: lost+found Links main $main snap $snap, want 3 in both"
+	exit 1
+    fi
+}
+
+test_reattach_bumps_every_lostfound_version()
+{
+    reattach_counts touch
+}
+
+test_reattach_single_lostfound_version()
+{
+    reattach_counts notouch
+}
+
+# The field cycle: fsck reattaches a stale-count directory, the backup's
+# rsync --delete removes it from lost+found, and snapshot rotation collapses
+# the interior node holding the history.
+test_reattach_rmdir_collapse()
+{
+    orphan_in_interior touch 2
+    local interior=$(inode_snaps $o_inum)
+
+    local rc=0
+    bcachefs fsck -y ${ktest_scratch_dev[0]} || rc=$?
+    echo "fsck -y exited $rc"
+    show_dir lost+found $lf_inum
+
+    mount -t bcachefs ${ktest_scratch_dev[0]} /mnt
+    local name=$(ls /mnt/lost+found)
+    if [[ -z $name ]]; then
+	echo "FAILED: setup - fsck reattached nothing into lost+found"
+	exit 1
+    fi
+    rmdir /mnt/lost+found/$name
+    stat_links /mnt/lost+found > /dev/null
+
+    local leaf=$(subvol_snapshot 2)
+    bcachefs subvolume delete /mnt/snap
+
+    # The delete finishes in a workqueue; the trigger only collects what is
+    # already marked.
+    local STATE_S_WILL_DELETE=$((0x3316a8d2))
+    local STATE_S_DELETED=$((0x7cd4a225))
+    local i state
+    for i in $(seq 30); do
+	state=$(snap_state $leaf)
+	[[ $state == $STATE_S_WILL_DELETE || $state == $STATE_S_DELETED ]] && break
+	sleep 1
+    done
+    if [[ $state != $STATE_S_WILL_DELETE && $state != $STATE_S_DELETED ]]; then
+	echo "FAILED: setup - snap's leaf $leaf not marked for deletion (state $state)"
+	exit 1
+    fi
+
+    echo 1 > /sys/fs/bcachefs/*/internal/trigger_delete_dead_snapshots
+    umount /mnt
+
+    local STATE_S_NO_KEYS=$((0x372b5a01))
+    if [[ $(snap_state $interior) != $STATE_S_NO_KEYS ]]; then
+	echo "FAILED: setup - interior $interior did not collapse" \
+	     "(state $(snap_state $interior))"
+	exit 1
+    fi
+
+    show_dir o $o_inum
+    show_dir lost+found $lf_inum
+    mount -t bcachefs ${ktest_scratch_dev[0]} /mnt
+    stat_links /mnt/lost+found > /dev/null
+    umount /mnt
+
+    if [[ -n $(inode_snaps $o_inum) ]]; then
+	fsck_clean "o survived its rmdir, and fsck -n reports it"
+	echo "FAILED: o survived its rmdir"
+	exit 1
+    fi
+    fsck_clean "fsck -n not clean after the collapse"
+}
+
+main "$@"
