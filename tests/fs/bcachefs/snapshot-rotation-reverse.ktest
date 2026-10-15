@@ -1,0 +1,399 @@
+#!/usr/bin/env bash
+#
+# Rewrite files in place in a writable snapshot of an old rotation snapshot,
+# whose original subvolume and first snapshot are long deleted, taking a
+# read-only snapshot after each pass, while the live home keeps churning under
+# a daily-style snapshot rotation. Every read-only snapshot must keep exactly
+# the content it was taken with.
+#
+# Reproducer for a field report on v1.39.7: this history left read-only
+# snapshots missing some in-place writes, the previous pass's data showing
+# through, then fsck found extent_overlapping, inode_i_sectors_wrong and
+# bkey_in_deleted_interior_snapshot; inode_i_sectors_underflow fired at runtime
+# right after a snapshot. Only userspace I/O was involved.
+#
+# The sequence, as on the host:
+#   A, filled -> A' = ro snapshot of A -> A deleted
+#   home = writable snapshot of A', churned and snapshotted daily (B, C, D, ...)
+#     with rotation until A' itself is deleted
+#   work = writable snapshot of the oldest survivor B; change files dating
+#     from A in place (page rewrites, punch/zero/collapse/insert ranges,
+#     truncates, appends, deletes and recreates, so extent and dirent
+#     whiteouts), ro snapshot after each pass (Z, Y, X, ...), home's churn
+#     and rotation still running
+#
+# The expected content of each pass snapshot comes from an ext4 mirror that
+# receives the same bytes at the same offsets as work. Rotation snapshots are
+# checksummed right after creation, before anything else touches the tree.
+#
+# Variants drop one factor at a time so a failure says which one matters:
+# reconcile across tiers.
+
+. $(dirname $(readlink -e "${BASH_SOURCE[0]}"))/bcachefs-test-libs.sh
+
+config-scratch-devs 8G
+config-scratch-devs 8G
+config-scratch-devs 16G
+config-scratch-devs 16G
+config-scratch-devs 16G
+config-mem 8G
+config-timeout $((60 * 60))
+
+NR_BIG_FILES=32
+NR_SMALL_FILES=200
+NR_DAYS=6
+KEEP_DAYS=3
+NR_PASSES=8
+
+ref_dev()  { echo ${ktest_scratch_dev[4]}; }
+
+bch_devs=()
+
+format_tiered()
+{
+    run_quiet "" bcachefs format -f		\
+	--data_replicas=2			\
+	--metadata_replicas=2			\
+	--compression=lz4			\
+	--background_compression=zstd		\
+	--foreground_target=nvme		\
+	--metadata_target=nvme			\
+	--background_target=hdd			\
+	--label=nvme.nvme1 ${ktest_scratch_dev[0]}	\
+	--label=nvme.nvme2 ${ktest_scratch_dev[1]}	\
+	--label=hdd.hdd1   ${ktest_scratch_dev[2]}	\
+	--label=hdd.hdd2   ${ktest_scratch_dev[3]}
+    bch_devs=("${ktest_scratch_dev[@]:0:4}")
+}
+
+format_single()
+{
+    run_quiet "" bcachefs format -f		\
+	--compression=lz4			\
+	${ktest_scratch_dev[0]}
+    bch_devs=("${ktest_scratch_dev[0]}")
+}
+
+bch_mount()
+{
+    local IFS=:
+    mount -t bcachefs "${bch_devs[*]}" /mnt
+}
+
+# Half random, half base64 of random: lz4 and zstd both find something to do
+# with the latter, so extents get rewritten by background compression.
+# base64 reads a bounded input: piping it into head would SIGPIPE it under
+# ktest's pipefail.
+fill()
+{
+    local f=$1 bytes=$2
+
+    if (( RANDOM % 2 )); then
+	head -c $bytes /dev/urandom > "$f"
+    else
+	head -c $((bytes * 3 / 4 + 3)) /dev/urandom | base64 -w0 > "$f"
+	truncate -s $bytes "$f"
+    fi
+}
+
+# Mostly 8 MB files, the sqlite-sized case, and a few larger ones.
+seed_tree()
+{
+    local d=$1 i
+
+    mkdir -p "$d/big" "$d/small"
+    for i in $(seq $NR_BIG_FILES); do
+	if (( RANDOM % 100 < 80 )); then
+	    fill "$d/big/$i" $((8 << 20))
+	else
+	    fill "$d/big/$i" $(( (16 + RANDOM % 48) << 20 ))
+	fi
+    done
+    for i in $(seq $NR_SMALL_FILES); do
+	fill "$d/small/$i" $((1 + RANDOM % 65536))
+    done
+}
+
+overwrite_pages()
+{
+    local f=$1 size pages nr i
+
+    size=$(stat -c %s "$f")
+    pages=$((size / 4096))
+    (( pages > 1 )) || return 0
+
+    nr=$((1 + RANDOM % 16))
+    for i in $(seq $nr); do
+	dd if=/dev/urandom of="$f" bs=4k conv=notrunc status=none \
+	    seek=$(( (RANDOM * 32768 + RANDOM) % pages )) count=$((1 + RANDOM % 64))
+    done
+}
+
+# One change to file $1, applied identically under work dir $2 and mirror dir
+# $3: page rewrites in place, fallocate range operations (extent whiteouts),
+# truncates, appends, and deletes or delete-and-recreate (dirent whiteouts).
+rewrite_both()
+{
+    local f=$1 a=$2 b=$3 chunk=/tmp/rewrite-chunk size pages nr i seek count r
+
+    r=$((RANDOM % 100))
+    if (( r < 3 )); then
+	last_op="delete"
+	rm "$a/$f" "$b/$f"
+	return
+    elif (( r < 5 )); then
+	last_op="delete and recreate"
+	rm "$a/$f" "$b/$f"
+	fill $chunk $((1 + RANDOM % (8 << 20)))
+	cp $chunk "$a/$f"
+	cp $chunk "$b/$f"
+	return
+    fi
+
+    size=$(stat -c %s "$a/$f")
+    pages=$((size / 4096))
+    (( pages > 2 )) || return 0
+    seek=$(( (RANDOM * 32768 + RANDOM) % (pages - 1) ))
+    count=$((1 + RANDOM % (pages - 1 - seek < 64 ? pages - 1 - seek : 64)))
+
+    if (( r < 55 )); then
+	last_op="page rewrites"
+	nr=$((1 + RANDOM % 16))
+	for i in $(seq $nr); do
+	    seek=$(( (RANDOM * 32768 + RANDOM) % pages ))
+	    count=$((1 + RANDOM % 64))
+	    head -c $((count * 4096)) /dev/urandom > $chunk
+	    dd if=$chunk of="$a/$f" bs=4k conv=notrunc status=none seek=$seek
+	    dd if=$chunk of="$b/$f" bs=4k conv=notrunc status=none seek=$seek
+	done
+    elif (( r < 65 )); then
+	last_op="punch $seek+$count"
+	fallocate -p -o $((seek * 4096)) -l $((count * 4096)) "$a/$f"
+	fallocate -p -o $((seek * 4096)) -l $((count * 4096)) "$b/$f"
+    elif (( r < 70 )); then
+	last_op="zero $seek+$count"
+	fallocate -z -o $((seek * 4096)) -l $((count * 4096)) "$a/$f"
+	fallocate -z -o $((seek * 4096)) -l $((count * 4096)) "$b/$f"
+    elif (( r < 75 )); then
+	cp "$b/$f" /ref/pre-op
+	last_op="collapse $seek+$count"
+	fallocate -c -o $((seek * 4096)) -l $((count * 4096)) "$a/$f"
+	fallocate -c -o $((seek * 4096)) -l $((count * 4096)) "$b/$f"
+    elif (( r < 80 )); then
+	cp "$b/$f" /ref/pre-op
+	last_op="insert $seek+$count"
+	fallocate -i -o $((seek * 4096)) -l $((count * 4096)) "$a/$f"
+	fallocate -i -o $((seek * 4096)) -l $((count * 4096)) "$b/$f"
+    elif (( r < 90 )); then
+	last_op="truncate $size -> $((size = size * (RANDOM % 100) / 100))"
+	truncate -s $size "$a/$f" "$b/$f"
+    else
+	head -c $(( (1 + RANDOM % 32) << 16 )) /dev/urandom > $chunk
+	last_op="append $(stat -c %s $chunk) at $size"
+	cat $chunk >> "$a/$f"
+	cat $chunk >> "$b/$f"
+    fi
+}
+
+# Work must match the mirror after every change: a divergence caught here
+# names the operation, where a snapshot mismatch later only names the file.
+check_change()
+{
+    local f=$1 a=$2 b=$3
+
+    [[ -e $b/$f ]] || return 0
+    cmp -s "$a/$f" "$b/$f" && return 0
+
+    echo "FAIL: $f differs from its mirror right after: $last_op"
+    echo "sizes: work $(stat -c %s "$a/$f") mirror $(stat -c %s "$b/$f")"
+    cmp -l "$a/$f" "$b/$f" | awk 'NR == 1 { first = $1 } { n++; last = $1 }
+	END { printf "%d bytes differ, first at %d (page %d), last at %d (page %d)\n",
+	      n, first, (first - 1) / 4096, last, (last - 1) / 4096 }' || true
+    [[ $last_op = insert* || $last_op = collapse* ]] && expected_shift "$a/$f" "$b/$f"
+    return 1
+}
+
+# Rebuild what a collapse or insert must produce from the copy taken before
+# it, and say which side, bcachefs or the ext4 mirror, got it wrong.
+expected_shift()
+{
+    local work=$1 mirror=$2 op seek count exp=/ref/expected-op
+
+    read op seek count <<< "${last_op/+/ }"
+    dd if=/ref/pre-op of=$exp bs=4k count=$seek status=none
+    if [[ $op = insert ]]; then
+	truncate -s $(( (seek + count) * 4096 )) $exp
+	dd if=/ref/pre-op of=$exp bs=4k skip=$seek seek=$((seek + count)) status=none
+    else
+	dd if=/ref/pre-op of=$exp bs=4k skip=$((seek + count)) seek=$seek status=none
+    fi
+    cmp -s $exp "$work" && echo "bcachefs matches the expected $op" || echo "bcachefs is WRONG for the $op"
+    cmp -s $exp "$mirror" && echo "ext4 mirror matches the expected $op" || echo "ext4 mirror is WRONG for the $op"
+}
+
+record_sums()
+{
+    local name=$1 dir=$2
+
+    (cd "$dir" && find . -type f -print0 | sort -z | xargs -0r md5sum) > /ref/sums-$name
+}
+
+verify_sums()
+{
+    local name=$1 dir=$2 when=$3 out
+
+    if ! out=$(cd "$dir" && md5sum -c --quiet /ref/sums-$name 2>&1); then
+	echo "FAIL ($when): $name content differs:"
+	echo "$out" | head -20
+	return 1
+    fi
+    if ! out=$(diff <(cut -c35- /ref/sums-$name) <(cd "$dir" && find . -type f | sort)); then
+	echo "FAIL ($when): $name file list differs:"
+	echo "$out" | head -20
+	return 1
+    fi
+}
+
+# Every read-only snapshot still present that has recorded sums: the rotation
+# may have deleted some, and a kill can land between a snapshot and its sums.
+verify_all()
+{
+    local when=$1 s name ret=0
+
+    for s in /mnt/snaps/*; do
+	name=$(basename $s)
+	[[ -e /ref/sums-$name ]] || continue
+	verify_sums $name $s $when || ret=1
+    done
+    return $ret
+}
+
+churn_home()
+{
+    local f size
+
+    for f in /mnt/home/big/*; do
+	if (( RANDOM % 100 < 40 )); then
+	    overwrite_pages "$f"
+	elif (( RANDOM % 100 < 10 )); then
+	    size=$(stat -c %s "$f")
+	    fallocate -p -o $(( (RANDOM % (size / 4096 + 1)) * 4096 )) -l $((64 << 10)) "$f"
+	fi
+    done
+    return 0
+}
+
+# Snapshot home as day-$n and delete the oldest of the snapshots named on the
+# command line beyond KEEP_DAYS; prints the survivors, so all else goes to stderr.
+rotate_day()
+{
+    local n=$1
+    shift
+    local snaps=("$@" day-$n)
+
+    bcachefs subvolume snapshot -r /mnt/home /mnt/snaps/day-$n >&2
+    record_sums day-$n /mnt/snaps/day-$n
+    while (( ${#snaps[@]} > KEEP_DAYS )); do
+	bcachefs subvolume delete /mnt/snaps/${snaps[0]} >&2
+	rm /ref/sums-${snaps[0]}
+	snaps=("${snaps[@]:1}")
+    done
+    echo "${snaps[@]}"
+}
+
+# home's churn and rotation while work is rewritten; work's source is kept,
+# as the host's yearly retention kept it.
+home_antagonist()
+{
+    local n=$1
+    shift
+    local snaps=("$@")
+
+    while true; do
+	churn_home
+	n=$((n + 1))
+	snaps=($(rotate_day $n "${snaps[@]}"))
+	sleep 2
+    done
+}
+
+run_rotation_reverse()
+{
+    local fmt=$1 n snaps oldest p f antagonist
+
+    mkfs.ext4 -q -F "$(ref_dev)"
+    mkdir -p /ref
+    mount "$(ref_dev)" /ref
+
+    $fmt
+    bch_mount
+    mkdir /mnt/snaps
+
+    bcachefs subvolume create /mnt/a
+    seed_tree /mnt/a
+    bcachefs subvolume snapshot -r /mnt/a /mnt/snaps/a0
+    record_sums a0 /mnt/snaps/a0
+    bcachefs subvolume delete /mnt/a
+
+    bcachefs subvolume snapshot /mnt/snaps/a0 /mnt/home
+    snaps=(a0)
+    for n in $(seq $NR_DAYS); do
+	echo ":: day $n"
+	churn_home
+	snaps=($(rotate_day $n "${snaps[@]}"))
+    done
+    if [[ -e /mnt/snaps/a0 ]]; then
+	echo "FAIL: rotation never deleted a0; raise NR_DAYS above KEEP_DAYS"
+	return 1
+    fi
+
+    oldest=${snaps[0]}
+    verify_sums $oldest /mnt/snaps/$oldest "before work"
+    bcachefs subvolume snapshot /mnt/snaps/$oldest /mnt/work
+    mkdir /ref/mirror
+    cp -a /mnt/snaps/$oldest/. /ref/mirror/
+
+    home_antagonist $NR_DAYS "${snaps[@]:1}" &
+    antagonist=$!
+
+    for p in $(seq $NR_PASSES); do
+	echo ":: pass $p"
+	for f in $(cd /ref/mirror && echo big/* small/*); do
+	    (( RANDOM % 100 < 50 )) || continue
+	    rewrite_both "$f" /mnt/work /ref/mirror
+	    check_change "$f" /mnt/work /ref/mirror
+	done
+	bcachefs subvolume snapshot -r /mnt/work /mnt/snaps/pass-$p
+	record_sums pass-$p /ref/mirror
+	verify_sums pass-$p /mnt/snaps/pass-$p "just taken"
+    done
+
+    if ! kill $antagonist; then
+	echo "FAIL: home antagonist exited before the passes finished"
+	return 1
+    fi
+    wait $antagonist || true
+
+    verify_all mounted
+
+    umount /mnt
+    bch_mount
+    verify_all remounted
+    umount /mnt
+    umount /ref
+
+    bcachefs fsck -n "${bch_devs[@]}"
+    bcachefs_test_end_checks "${bch_devs[@]}"
+}
+
+test_rotation_reverse_tiered()
+{
+    run_rotation_reverse format_tiered
+}
+
+test_rotation_reverse_single()
+{
+    run_rotation_reverse format_single
+}
+
+main "$@"
