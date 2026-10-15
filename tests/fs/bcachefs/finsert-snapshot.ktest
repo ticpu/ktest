@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+#
+# fallocate insert range on a file whose extents are shared with snapshots.
+# Found by snapshot-rotation-reverse.ktest on v1.39.7: inserting 17 pages at
+# page 419 of an 8 MB file in a writable snapshot left the file wrong past the
+# insert, while ext4 matched the expected shift. Each variant adds one
+# ingredient of that file's history, so the first one to fail names what
+# matters.
+
+. $(dirname $(readlink -e "${BASH_SOURCE[0]}"))/bcachefs-test-libs.sh
+
+config-scratch-devs 4G
+config-mem 2G
+config-timeout $((10 * 60))
+
+SEEK=419
+COUNT=17
+
+# The file as it must be after inserting COUNT zero pages at SEEK into $1.
+expected_insert()
+{
+    local pre=$1 exp=$2
+
+    dd if=$pre of=$exp bs=4k count=$SEEK status=none
+    truncate -s $(( (SEEK + COUNT) * 4096 )) $exp
+    dd if=$pre of=$exp bs=4k skip=$SEEK seek=$((SEEK + COUNT)) status=none
+}
+
+check_insert()
+{
+    local f=$1 when=$2
+
+    if ! cmp -s /tmp/expected $f; then
+	echo "FAIL ($when): $f differs from the expected insert:"
+	cmp -l /tmp/expected $f | awk 'NR == 1 { first = $1 } { n++; last = $1 }
+	    END { printf "%d bytes differ, first at page %d, last at page %d\n",
+		  n, (first - 1) / 4096, (last - 1) / 4096 }' || true
+	return 1
+    fi
+}
+
+# $1 sets up the subvolumes and prints the path of the file to insert into.
+run_finsert()
+{
+    local setup=$1 f
+
+    run_quiet "" bcachefs format -f --compression=lz4 ${ktest_scratch_dev[0]}
+    mount -t bcachefs ${ktest_scratch_dev[0]} /mnt
+
+    f=$($setup)
+    cp $f /tmp/pre
+    expected_insert /tmp/pre /tmp/expected
+    fallocate -i -o $((SEEK * 4096)) -l $((COUNT * 4096)) $f
+    check_insert $f mounted
+
+    umount /mnt
+    mount -t bcachefs ${ktest_scratch_dev[0]} /mnt
+    check_insert $f remounted
+    umount /mnt
+
+    bcachefs fsck -n ${ktest_scratch_dev[0]}
+}
+
+seed()
+{
+    head -c $((8 << 20)) /dev/urandom > $1
+    sync
+}
+
+setup_plain()
+{
+    seed /mnt/f
+    echo /mnt/f
+}
+
+setup_ro_snapshot()
+{
+    bcachefs subvolume create /mnt/a >&2
+    seed /mnt/a/f
+    bcachefs subvolume snapshot -r /mnt/a /mnt/a-ro >&2
+    echo /mnt/a/f
+}
+
+setup_snapshot_of_snapshot()
+{
+    bcachefs subvolume create /mnt/a >&2
+    seed /mnt/a/f
+    bcachefs subvolume snapshot -r /mnt/a /mnt/a-ro >&2
+    bcachefs subvolume snapshot /mnt/a-ro /mnt/w >&2
+    echo /mnt/w/f
+}
+
+setup_deleted_ancestors()
+{
+    bcachefs subvolume create /mnt/a >&2
+    seed /mnt/a/f
+    bcachefs subvolume snapshot -r /mnt/a /mnt/a-ro >&2
+    bcachefs subvolume delete /mnt/a >&2
+    bcachefs subvolume snapshot /mnt/a-ro /mnt/home >&2
+    bcachefs subvolume snapshot -r /mnt/home /mnt/b >&2
+    bcachefs subvolume delete /mnt/a-ro >&2
+    bcachefs subvolume snapshot /mnt/b /mnt/w >&2
+    echo /mnt/w/f
+}
+
+test_finsert_plain()			{ run_finsert setup_plain; }
+test_finsert_ro_snapshot()		{ run_finsert setup_ro_snapshot; }
+test_finsert_snapshot_of_snapshot()	{ run_finsert setup_snapshot_of_snapshot; }
+test_finsert_deleted_ancestors()	{ run_finsert setup_deleted_ancestors; }
+
+main "$@"
